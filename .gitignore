@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.deps/
+.pytest-deps/
+.pytest-tmp/
+data/*.db
+data/*.json
+data/*.csv
+reports/
