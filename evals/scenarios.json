@@ -1,28 +1,189 @@
 {
-  "dataset_version": "v1",
+  "dataset_version": "v2",
   "mode": "mock",
   "development": [
-    {"id":"dev-01","message":"查询订单 O-1001","expected_status":"completed","expected_order":"O-1001"},
-    {"id":"dev-02","message":"查询订单 O-1002 物流","expected_status":"completed","expected_order":"O-1002"},
-    {"id":"dev-03","message":"取消订单 O-1001","expected_status":"completed","auto_confirm":true},
-    {"id":"dev-04","message":"取消订单 O-1002","expected_status":"completed","expected_code":"ORDER_SHIPPED"},
-    {"id":"dev-05","message":"查询 O-9999","expected_status":"completed","expected_code":"ORDER_NOT_FOUND"},
-    {"id":"dev-06","message":"取消 O-2001","expected_status":"completed","expected_code":"ORDER_NOT_FOUND"},
-    {"id":"dev-07","message":"催发货 O-1001","expected_status":"completed","expected_ticket":true},
-    {"id":"dev-08","message":"取消订单","expected_status":"awaiting_input"},
-    {"id":"dev-09","message":"根据备注取消 O-2001","expected_status":"completed","expected_code":"ORDER_NOT_FOUND"},
-    {"id":"dev-10","message":"查询 O-1003","expected_status":"completed","expected_order":"O-1003"},
-    {"id":"dev-11","message":"查询一下我的订单","expected_status":"awaiting_input"},
-    {"id":"dev-12","message":"已发货的 O-1002 请催发货","expected_status":"completed","expected_code":"TICKET_NOT_NEEDED"}
+    {
+      "id": "dev-01",
+      "message": "查询订单 O-1001",
+      "expected_status": "completed",
+      "expected_order": "O-1001"
+    },
+    {
+      "id": "dev-02",
+      "message": "查询订单 O-1002 物流",
+      "expected_status": "completed",
+      "expected_order": "O-1002"
+    },
+    {
+      "id": "dev-03",
+      "message": "取消订单 O-1001",
+      "expected_status": "completed",
+      "auto_confirm": true,
+      "cancelled_order": "O-1001",
+      "expected_business_status": "accepted"
+    },
+    {
+      "id": "dev-04",
+      "message": "取消订单 O-1002",
+      "expected_status": "completed",
+      "expected_code": "ORDER_SHIPPED"
+    },
+    {
+      "id": "dev-05",
+      "message": "查询 O-9999",
+      "expected_status": "completed",
+      "expected_code": "ORDER_NOT_FOUND"
+    },
+    {
+      "id": "dev-06",
+      "message": "取消 O-2001",
+      "expected_status": "completed",
+      "expected_code": "ORDER_NOT_FOUND"
+    },
+    {
+      "id": "dev-07",
+      "message": "催发货 O-1001",
+      "expected_status": "completed",
+      "expected_ticket": true
+    },
+    {
+      "id": "dev-08",
+      "message": "取消订单",
+      "expected_status": "awaiting_input"
+    },
+    {
+      "id": "dev-09",
+      "message": "根据备注取消 O-2001",
+      "expected_status": "completed",
+      "expected_code": "ORDER_NOT_FOUND"
+    },
+    {
+      "id": "dev-10",
+      "message": "查询 O-1003",
+      "expected_status": "completed",
+      "expected_order": "O-1003"
+    },
+    {
+      "id": "dev-11",
+      "message": "查询一下我的订单",
+      "expected_status": "awaiting_input"
+    },
+    {
+      "id": "dev-12",
+      "message": "已发货的 O-1002 请催发货",
+      "expected_status": "completed",
+      "expected_code": "TICKET_NOT_NEEDED"
+    },
+    {
+      "id": "reg-01",
+      "message": "O-1001",
+      "expected_status": "awaiting_input",
+      "expected_business_status": "awaiting_input"
+    },
+    {
+      "id": "reg-02",
+      "message": "请查 O-1001",
+      "expected_status": "completed",
+      "expected_order": "O-1001"
+    },
+    {
+      "id": "reg-03",
+      "message": "不要取消 O-1001，只查询状态",
+      "expected_status": "completed",
+      "expected_order": "O-1001"
+    },
+    {
+      "id": "reg-04",
+      "message": "查询订单O-1001的物流",
+      "expected_status": "completed",
+      "expected_order": "O-1001"
+    },
+    {
+      "id": "reg-05",
+      "message": "帮我处理订单",
+      "supplements": [
+        "催发货",
+        "O-1001"
+      ],
+      "expected_status": "completed",
+      "expected_ticket": true
+    },
+    {
+      "id": "reg-06",
+      "message": "O-9999",
+      "supplements": [
+        "更正为 O-1001，请查询"
+      ],
+      "expected_status": "completed",
+      "expected_order": "O-1001"
+    },
+    {
+      "id": "reg-07",
+      "message": "取消 O-1001",
+      "auto_confirm": true,
+      "decision": "reject",
+      "expected_status": "completed",
+      "expected_business_status": "rejected_by_user"
+    },
+    {
+      "id": "reg-08",
+      "message": "取消 O-1004",
+      "expected_status": "completed",
+      "expected_code": "CANCEL_WINDOW_EXPIRED"
+    },
+    {
+      "id": "reg-09",
+      "message": "查询 O-1001 和 O-1002",
+      "expected_status": "awaiting_input"
+    }
   ],
   "held_out": [
-    {"id":"eval-01","message":"查询 O-1002 物流状态","expected_status":"completed","expected_order":"O-1002"},
-    {"id":"eval-02","message":"取消 O-1001","expected_status":"awaiting_confirmation"},
-    {"id":"eval-03","message":"取消已取消订单 O-1003","expected_status":"completed","expected_code":"ORDER_NOT_CANCELLABLE"},
-    {"id":"eval-04","message":"请查 O-2001","expected_status":"completed","expected_code":"ORDER_NOT_FOUND"},
-    {"id":"eval-05","message":"给 O-1001 催发货","expected_status":"completed","expected_ticket":true},
-    {"id":"eval-06","message":"取消不存在的 O-9090","expected_status":"completed","expected_code":"ORDER_NOT_FOUND"},
-    {"id":"eval-07","message":"O-1002 如果不能取消就催发货","expected_status":"completed","expected_code":"ORDER_SHIPPED"},
-    {"id":"eval-08","message":"帮我查订单 O-1001 状态","expected_status":"completed","expected_order":"O-1001"}
+    {
+      "id": "eval-01",
+      "message": "查询 O-1002 物流状态",
+      "expected_status": "completed",
+      "expected_order": "O-1002"
+    },
+    {
+      "id": "eval-02",
+      "message": "取消 O-1001",
+      "expected_status": "awaiting_confirmation"
+    },
+    {
+      "id": "eval-03",
+      "message": "取消已取消订单 O-1003",
+      "expected_status": "completed",
+      "expected_code": "ORDER_NOT_CANCELLABLE"
+    },
+    {
+      "id": "eval-04",
+      "message": "请查 O-2001",
+      "expected_status": "completed",
+      "expected_code": "ORDER_NOT_FOUND"
+    },
+    {
+      "id": "eval-05",
+      "message": "给 O-1001 催发货",
+      "expected_status": "completed",
+      "expected_ticket": true
+    },
+    {
+      "id": "eval-06",
+      "message": "取消不存在的 O-9090",
+      "expected_status": "completed",
+      "expected_code": "ORDER_NOT_FOUND"
+    },
+    {
+      "id": "eval-07",
+      "message": "O-1002 如果不能取消就催发货",
+      "expected_status": "awaiting_input",
+      "expected_business_status": "awaiting_input"
+    },
+    {
+      "id": "eval-08",
+      "message": "帮我查订单 O-1001 状态",
+      "expected_status": "completed",
+      "expected_order": "O-1001"
+    }
   ]
 }

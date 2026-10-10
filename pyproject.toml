@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supportflow"
-version = "0.1.0"
-description = "订单售后多 Agent 后端 MVP"
+version = "0.2.0"
+description = "订单售后单 Agent 与事务工作流后端 MVP"
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.110,<1",

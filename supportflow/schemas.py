@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ToolResult(BaseModel):
@@ -12,16 +12,30 @@ class ToolResult(BaseModel):
 
 
 class TaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     message: str = Field(min_length=1, max_length=8000)
-    mode: Literal["mock", "live", "multi_agent", "single_agent"] = "multi_agent"
+    execution_mode: Literal["mock", "live"] | None = None
+    agent_mode: Literal["single_agent"] = "single_agent"
+    mode: Literal["mock", "live", "multi_agent", "single_agent"] | None = None
+
+    @model_validator(mode="after")
+    def consistent_modes(self):
+        if self.mode in {"mock", "live"} and self.execution_mode and self.mode != self.execution_mode:
+            raise ValueError("mode 与 execution_mode 冲突")
+        return self
+
+    def resolved_execution_mode(self, default: str) -> str:
+        return self.execution_mode or (self.mode if self.mode in {"mock", "live"} else default)
 
 
 class EventCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     type: Literal["user_message", "order_selection", "supplement"] = "supplement"
     content: str = Field(min_length=1, max_length=8000)
 
 
 class ConfirmationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     action_id: str = Field(min_length=1, max_length=100)
     decision: Literal["approve", "reject"]
 
@@ -39,11 +53,11 @@ class PendingAction(BaseModel):
 
 
 class AgentDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     intent: Literal["query_order", "cancel_order", "create_ticket", "unknown"] = "unknown"
-    next_agent: Literal["order", "aftersales", "clarify", "finish", "handoff"] = "clarify"
-    order_id: str | None = None
-    missing_fields: list[str] = Field(default_factory=list)
-    reason_summary: str = ""
+    order_id: str | None = Field(default=None, pattern=r"^O-[0-9]{4}$")
+    missing_fields: list[Literal["intent", "order_id"]] = Field(default_factory=list)
+    reason_summary: str = Field(default="", max_length=500)
 
 
 class TaskView(BaseModel):
@@ -51,6 +65,8 @@ class TaskView(BaseModel):
     customer_id: str
     status: str
     mode: str
+    execution_mode: str | None = None
+    agent_mode: str = "single_agent"
     message: str
     intent: str | None = None
     pending_action: dict[str, Any] | None = None
@@ -65,7 +81,9 @@ class HealthView(BaseModel):
     run_mode: str
     live_configured: bool
     worker: str
+    worker_alive: bool = False
+    database_ok: bool = False
 
 
 def now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")

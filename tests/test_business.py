@@ -95,6 +95,7 @@ def test_workflow_recovers_after_approval_before_cancel(tmp_path):
     final = db.get_task(row["task_id"])
     assert final["status"] == "completed"
     assert db.get_order("O-1001")["status"] == "cancelled"
+    engine.close()
 
 
 def test_idempotency_does_not_override_other_customer_note(tmp_path):

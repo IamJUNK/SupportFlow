@@ -4,13 +4,15 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .policy import cancel_error, failure, utc_datetime
+
 
 def utc_now() -> str:
-    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def json_text(value: Any) -> str:
@@ -146,24 +148,34 @@ class Database:
                 conn.execute("ALTER TABLE trace_events ADD COLUMN usage_json TEXT")
             if "cost_json" not in columns:
                 conn.execute("ALTER TABLE trace_events ADD COLUMN cost_json TEXT")
+            task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+            for name, definition in {"context_json": "TEXT", "execution_mode": "TEXT", "agent_mode": "TEXT NOT NULL DEFAULT 'single_agent'"}.items():
+                if name not in task_columns:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_task_queue ON tasks(status, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_events_task ON task_events(task_id, processed)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_trace_task ON trace_events(task_id)")
 
-    def seed_demo(self) -> None:
+    def seed_demo(self, now: str | None = None) -> None:
+        anchor = utc_datetime(now)
+        def ago(hours: int) -> str:
+            return (anchor - timedelta(hours=hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0:
                 conn.executemany(
                     "INSERT INTO orders(order_id,customer_id,status,created_at,version,paid,note) VALUES(?,?,?,?,?,?,?)",
                     [
-                        ("O-1001", "demo-customer", "pending", "2026-10-07T09:00:00Z", 1, 1, "普通订单"),
-                        ("O-1002", "demo-customer", "shipped", "2026-10-01T09:00:00Z", 2, 1, "已交给承运商"),
-                        ("O-1003", "demo-customer", "cancelled", "2026-10-02T09:00:00Z", 2, 1, "用户已取消"),
-                        ("O-1004", "demo-customer", "pending", "2026-10-05T09:00:00Z", 1, 1, "超过取消窗口"),
-                        ("O-2001", "other-customer", "pending", "2026-10-07T10:00:00Z", 1, 1, "另一位客户订单"),
+                        ("O-1001", "demo-customer", "pending", ago(1), 1, 1, "普通订单"),
+                        ("O-1002", "demo-customer", "shipped", ago(168), 2, 1, "已交给承运商"),
+                        ("O-1003", "demo-customer", "cancelled", ago(144), 2, 1, "用户已取消"),
+                        ("O-1004", "demo-customer", "pending", ago(72), 1, 1, "超过取消窗口"),
+                        ("O-2001", "other-customer", "pending", ago(1), 1, 1, "另一位客户订单"),
                     ],
                 )
                 conn.executemany(
                     "INSERT INTO tracking(order_id,status,updated_at) VALUES(?,?,?)",
-                    [("O-1001", "not_shipped", "2026-10-07T09:00:00Z"), ("O-1002", "in_transit", "2026-10-06T12:00:00Z")],
+                    [("O-1001", "not_shipped", ago(1)), ("O-1002", "in_transit", ago(24))],
                 )
             if conn.execute("SELECT COUNT(*) FROM policies").fetchone()[0] == 0:
                 conn.executemany(
@@ -175,8 +187,10 @@ class Database:
                 )
             conn.commit()
 
-    def create_task(self, customer_id: str, message: str, mode: str, idempotency_key: str | None) -> tuple[dict[str, Any], bool]:
+    def create_task(self, customer_id: str, message: str, mode: str, idempotency_key: str | None, execution_mode: str | None = None) -> tuple[dict[str, Any], bool]:
         request_hash = hashlib.sha256(json_text({"message": message, "mode": mode}).encode()).hexdigest()
+        if execution_mode is not None:
+            request_hash = hashlib.sha256(json_text({"message": message, "mode": mode, "execution_mode": execution_mode}).encode()).hexdigest()
         task_id = "tsk-" + uuid.uuid4().hex[:16]
         now = utc_now()
         with self.connection() as conn:
@@ -191,8 +205,8 @@ class Database:
                         raise ConflictError("Idempotency-Key 已用于不同请求")
                     return dict(row), False
             conn.execute(
-                "INSERT INTO tasks(task_id,customer_id,status,mode,message,request_hash,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (task_id, customer_id, "queued", mode, message, request_hash, idempotency_key, now, now),
+                "INSERT INTO tasks(task_id,customer_id,status,mode,message,request_hash,idempotency_key,created_at,updated_at,execution_mode) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (task_id, customer_id, "queued", mode, message, request_hash, idempotency_key, now, now, execution_mode),
             )
             conn.commit()
             return dict(conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()), True
@@ -208,7 +222,7 @@ class Database:
 
     def update_task(self, task_id: str, **fields: Any) -> None:
         fields["updated_at"] = utc_now()
-        allowed = {"status", "intent", "result_json", "error", "updated_at"}
+        allowed = {"status", "intent", "result_json", "error", "updated_at", "context_json", "execution_mode"}
         fields = {key: value for key, value in fields.items() if key in allowed}
         if not fields:
             return
@@ -229,7 +243,27 @@ class Database:
 
     def recover_running_tasks(self) -> int:
         with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            actions = conn.execute("SELECT a.* FROM pending_actions a JOIN tasks t ON t.task_id=a.task_id WHERE a.status='pending' AND t.status!='completed'").fetchall()
+            for action in actions:
+                decisions = set()
+                for event in conn.execute("SELECT content FROM task_events WHERE task_id=? AND event_type='confirmation' AND processed=0 ORDER BY rowid", (action["task_id"],)):
+                    try:
+                        data = json.loads(event["content"])
+                        if data.get("action_id") == action["action_id"] and data.get("decision") in {"approve", "reject"}:
+                            decisions.add(data["decision"])
+                    except (ValueError, AttributeError):
+                        continue
+                if len(decisions) == 1:
+                    status = "approved" if decisions == {"approve"} else "rejected"
+                    conn.execute("UPDATE pending_actions SET status=?,decided_at=? WHERE action_id=?", (status, utc_now(), action["action_id"]))
+                    conn.execute("UPDATE tasks SET status='queued',error=NULL WHERE task_id=?", (action["task_id"],))
+                elif len(decisions) > 1:
+                    conn.execute("UPDATE tasks SET status='awaiting_confirmation',error=? WHERE task_id=?", ("旧版本存在冲突确认，请重新确认当前方案", action["task_id"],))
+                    conn.execute("UPDATE task_events SET processed=1 WHERE task_id=? AND event_type='confirmation'", (action["task_id"],))
+            conn.execute("UPDATE tasks SET status='queued' WHERE status='awaiting_input' AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=tasks.task_id AND e.processed=0 AND e.event_type!='confirmation')")
             cur = conn.execute("UPDATE tasks SET status='queued', updated_at=? WHERE status='running'", (utc_now(),))
+            conn.commit()
             return cur.rowcount
 
     def append_event(self, task_id: str, event_type: str, content: str) -> str:
@@ -240,24 +274,82 @@ class Database:
 
     def unprocessed_events(self, task_id: str) -> list[dict[str, Any]]:
         with self.connection() as conn:
-            rows = conn.execute("SELECT * FROM task_events WHERE task_id=? AND processed=0 ORDER BY created_at", (task_id,)).fetchall()
+            rows = conn.execute("SELECT * FROM task_events WHERE task_id=? AND processed=0 ORDER BY rowid", (task_id,)).fetchall()
             return [dict(row) for row in rows]
 
-    def mark_events_processed(self, task_id: str) -> None:
+    def mark_events_processed(self, task_id: str, event_ids: list[str]) -> None:
         with self.connection() as conn:
-            conn.execute("UPDATE task_events SET processed=1 WHERE task_id=?", (task_id,))
+            conn.executemany("UPDATE task_events SET processed=1 WHERE task_id=? AND event_id=?", [(task_id, event_id) for event_id in event_ids])
 
-    def create_pending_action(self, task_id: str, order_id: str, operation: str, parameters: dict[str, Any], order_version: int, policy_version: str) -> dict[str, Any]:
-        existing = self.get_pending_action(task_id)
-        if existing and existing["status"] == "pending":
-            return existing
-        action_id = "act-" + uuid.uuid4().hex[:16]
+    def task_events(self, task_id: str) -> list[dict[str, Any]]:
         with self.connection() as conn:
-            conn.execute(
-                "INSERT INTO pending_actions(action_id,task_id,order_id,operation,parameters_json,order_version,policy_version,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (action_id, task_id, order_id, operation, json_text(parameters), order_version, policy_version, "pending", utc_now()),
-            )
-        return self.get_pending_action(task_id)  # type: ignore[return-value]
+            return [dict(row) for row in conn.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY rowid", (task_id,))]
+
+    def submit_event(self, task_id: str, event_type: str, content: str) -> dict:
+        if event_type not in {"user_message", "order_selection", "supplement"}:
+            raise ValueError("不支持的事件类型")
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not task:
+                raise KeyError(task_id)
+            if task["status"] != "awaiting_input":
+                raise ConflictError("当前任务不接受补充；已完成任务请创建新任务")
+            action = conn.execute("SELECT 1 FROM pending_actions WHERE task_id=? LIMIT 1", (task_id,)).fetchone()
+            if action:
+                raise ConflictError("任务已有取消方案，请通过确认接口决定或创建新任务")
+            count = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0]
+            if count >= 30:
+                raise ConflictError("已达到补充轮次上限，请创建新任务")
+            conn.execute("INSERT INTO task_events(event_id,task_id,event_type,content,created_at) VALUES(?,?,?,?,?)", ("evt-" + uuid.uuid4().hex[:16], task_id, event_type, content, utc_now()))
+            conn.execute("UPDATE tasks SET status='queued',error=NULL,result_json=NULL,updated_at=? WHERE task_id=?", (utc_now(), task_id))
+            conn.commit()
+        return self.get_task(task_id)
+
+    def confirm_action(self, task_id: str, action_id: str, decision: str) -> dict:
+        if decision not in {"approve", "reject"}:
+            raise ValueError("无效确认决定")
+        desired = "approved" if decision == "approve" else "rejected"
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            action = conn.execute("SELECT * FROM pending_actions WHERE task_id=? AND action_id=?", (task_id, action_id)).fetchone()
+            if not action:
+                raise KeyError(action_id)
+            if action["status"] != "pending":
+                if action["status"] != desired:
+                    raise ConflictError("该方案已有相反决定，不能覆盖")
+                conn.execute("UPDATE tasks SET status='queued',error=NULL,result_json=NULL,updated_at=? WHERE task_id=? AND status='failed'", (utc_now(), task_id))
+                conn.commit()
+            else:
+                task = conn.execute("SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                if task["status"] not in {"awaiting_confirmation", "failed"}:
+                    raise ConflictError("任务尚未进入待确认状态")
+                conn.execute("UPDATE pending_actions SET status=?,decided_at=? WHERE action_id=? AND status='pending'", (desired, utc_now(), action_id))
+                conn.execute("INSERT INTO task_events(event_id,task_id,event_type,content,created_at) VALUES(?,?,?,?,?)", ("evt-" + uuid.uuid4().hex[:16], task_id, "confirmation", json_text({"action_id": action_id, "decision": decision}), utc_now()))
+                conn.execute("UPDATE tasks SET status='queued',error=NULL,result_json=NULL,updated_at=? WHERE task_id=?", (utc_now(), task_id))
+                conn.commit()
+        return self.get_task(task_id)
+
+    def retry_task(self, task_id: str) -> dict:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            task = conn.execute("SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not task:
+                raise KeyError(task_id)
+            if task["status"] != "failed":
+                raise ConflictError("仅技术失败任务可以重试")
+            conn.execute("UPDATE tasks SET status='queued',error=NULL,result_json=NULL,updated_at=? WHERE task_id=?", (utc_now(), task_id))
+            conn.commit()
+        return self.get_task(task_id)
+
+    def finish_task(self, task_id: str, status: str, result: dict | None, intent: str | None, context: dict, event_ids: list[str], error: str | None = None) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            updated = conn.execute("UPDATE tasks SET status=?,result_json=?,intent=?,context_json=?,error=?,updated_at=? WHERE task_id=? AND status='running'", (status, json_text(result) if result is not None else None, intent, json_text(context), error, utc_now(), task_id))
+            if updated.rowcount != 1:
+                raise ConflictError("任务状态在执行期间发生变化")
+            conn.executemany("UPDATE task_events SET processed=1 WHERE task_id=? AND event_id=?", [(task_id, event_id) for event_id in event_ids])
+            conn.commit()
 
     def get_pending_action(self, task_id: str, action_id: str | None = None) -> dict[str, Any] | None:
         with self.connection() as conn:
@@ -273,7 +365,37 @@ class Database:
 
     def set_action_status(self, action_id: str, status: str) -> None:
         with self.connection() as conn:
-            conn.execute("UPDATE pending_actions SET status=?, decided_at=? WHERE action_id=?", (status, utc_now(), action_id))
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status FROM pending_actions WHERE action_id=?", (action_id,)).fetchone()
+            if not row or status not in {"approved", "rejected"}:
+                raise ValueError("无效操作状态")
+            if row["status"] not in {"pending", status}:
+                raise ConflictError("不能覆盖已经提交的决定")
+            conn.execute("UPDATE pending_actions SET status=?, decided_at=? WHERE action_id=? AND status='pending'", (status, utc_now(), action_id))
+            conn.commit()
+
+    def propose_cancel_transaction(self, task_id: str, order_id: str, customer_id: str, policy_version: str, now: str | None = None) -> dict:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            task = conn.execute("SELECT customer_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not task or task["customer_id"] != customer_id:
+                return failure("TASK_NOT_FOUND", "任务不存在或不属于当前客户")
+            order = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
+            error = cancel_error(order, customer_id, policy_version, now)
+            if error:
+                return error
+            if not conn.execute("SELECT 1 FROM policies WHERE category='cancel' AND version=?", (policy_version,)).fetchone():
+                return failure("POLICY_UNSUPPORTED", "取消政策不存在")
+            action = conn.execute("SELECT * FROM pending_actions WHERE task_id=? ORDER BY rowid DESC LIMIT 1", (task_id,)).fetchone()
+            if action:
+                if action["status"] != "pending" or action["order_id"] != order_id or action["order_version"] != order["version"] or action["policy_version"] != policy_version:
+                    return failure("ACTION_CONFLICT", "已有方案与本次请求不一致，请创建新任务")
+                action_id = action["action_id"]
+            else:
+                action_id = "act-" + uuid.uuid4().hex[:16]
+                conn.execute("INSERT INTO pending_actions(action_id,task_id,order_id,operation,parameters_json,order_version,policy_version,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (action_id, task_id, order_id, "cancel_order", json_text({"order_id": order_id}), order["version"], policy_version, "pending", utc_now()))
+            conn.commit()
+        return {"ok": True, "data": {"executable": True, "pending_action": self.get_pending_action(task_id, action_id), "message": "可以取消，请确认此具体操作方案；执行时会重新检查时限"}}
 
     def get_order(self, order_id: str) -> dict[str, Any] | None:
         with self.connection() as conn:
@@ -289,10 +411,10 @@ class Database:
             row = conn.execute("SELECT * FROM tracking WHERE order_id=?", (order_id,)).fetchone()
             return dict(row) if row else None
 
-    def search_policies(self, query: str, category: str | None = None) -> list[dict[str, Any]]:
+    def search_policies(self, query: str, category: str | None = None, version: str | None = None) -> list[dict[str, Any]]:
         tokens = [token.lower() for token in query.split() if token]
         with self.connection() as conn:
-            rows = conn.execute("SELECT * FROM policies WHERE (? IS NULL OR category=?)", (category, category)).fetchall()
+            rows = conn.execute("SELECT * FROM policies WHERE (? IS NULL OR category=?) AND (? IS NULL OR version=?)", (category, category, version, version)).fetchall()
             scored = []
             for row in rows:
                 content = row["content"].lower()
@@ -316,9 +438,14 @@ class Database:
             row = conn.execute("SELECT result_json FROM operation_journal WHERE operation_key=?", (operation_key,)).fetchone()
             return json.loads(row[0]) if row else None
 
-    def cancel_order_transaction(self, operation_key: str, order_id: str, customer_id: str, expected_version: int) -> dict[str, Any]:
+    def cancel_order_transaction(self, operation_key: str, order_id: str, customer_id: str, expected_version: int, policy_version: str = "v1", now: str | None = None) -> dict[str, Any]:
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            action = conn.execute("SELECT a.*,t.customer_id FROM pending_actions a JOIN tasks t ON t.task_id=a.task_id WHERE a.action_id=?", (operation_key,)).fetchone()
+            if not action or action["customer_id"] != customer_id or action["order_id"] != order_id or action["operation"] != "cancel_order" or action["order_version"] != expected_version:
+                return failure("ACTION_NOT_FOUND", "取消方案不存在或参数不匹配")
+            if action["status"] != "approved":
+                return failure("ACTION_NOT_APPROVED", "操作尚未获得确认")
             journal = conn.execute("SELECT result_json FROM operation_journal WHERE operation_key=?", (operation_key,)).fetchone()
             if journal:
                 conn.commit()
@@ -326,13 +453,10 @@ class Database:
                 result["idempotent_replay"] = True
                 return result
             order = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
-            if not order or order["customer_id"] != customer_id:
-                result = {"ok": False, "error_code": "ORDER_NOT_FOUND", "error_message": "订单不存在或不属于当前客户"}
-            elif order["version"] != expected_version:
-                result = {"ok": False, "error_code": "ORDER_CHANGED", "error_message": "等待确认期间订单状态已经变化"}
-            elif order["status"] != "pending":
-                result = {"ok": False, "error_code": "ORDER_SHIPPED" if order["status"] == "shipped" else "ORDER_NOT_CANCELLABLE", "error_message": f"订单当前状态为 {order['status']}，不能取消"}
-            else:
+            result = cancel_error(order, customer_id, policy_version, now, expected_version)
+            if not result and (action["policy_version"] != policy_version or not conn.execute("SELECT 1 FROM policies WHERE category='cancel' AND version=?", (policy_version,)).fetchone()):
+                result = failure("POLICY_CHANGED", "取消政策已变化，请重新创建任务确认")
+            if not result:
                 refund_required = bool(order["paid"])
                 conn.execute("UPDATE orders SET status='cancelled', version=version+1, refund_required=? WHERE order_id=? AND version=?", (int(refund_required), order_id, expected_version))
                 result = {"ok": True, "data": {"order_id": order_id, "status": "cancelled", "refund_required": refund_required}, "idempotent_replay": False}
@@ -341,17 +465,21 @@ class Database:
             return result
 
     def create_ticket_transaction(self, order_id: str, customer_id: str, ticket_type: str, description: str) -> dict[str, Any]:
+        ticket_type = ticket_type.strip().lower()
+        if ticket_type != "expedite":
+            return failure("INVALID_TICKET_TYPE", "当前仅支持 expedite 催发货工单")
         business_key = f"{order_id}:{ticket_type}"
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            order = conn.execute("SELECT customer_id,status FROM orders WHERE order_id=?", (order_id,)).fetchone()
+            if not order or order["customer_id"] != customer_id:
+                return failure("ORDER_NOT_FOUND", "订单不存在或不属于当前客户")
             existing = conn.execute("SELECT * FROM tickets WHERE business_key=?", (business_key,)).fetchone()
             if existing:
                 conn.commit()
                 return {"ok": True, "data": {"ticket_id": existing["ticket_id"], "duplicate": True}}
-            order = conn.execute("SELECT customer_id FROM orders WHERE order_id=?", (order_id,)).fetchone()
-            if not order or order["customer_id"] != customer_id:
-                conn.commit()
-                return {"ok": False, "error_code": "ORDER_NOT_FOUND", "error_message": "订单不存在或不属于当前客户"}
+            if order["status"] != "pending":
+                return failure("TICKET_NOT_NEEDED", f"订单当前状态为 {order['status']}，不创建催发货工单")
             ticket_id = "tic-" + uuid.uuid4().hex[:16]
             conn.execute("INSERT INTO tickets(ticket_id,order_id,customer_id,type,description,status,business_key,created_at) VALUES(?,?,?,?,?,?,?,?)", (ticket_id, order_id, customer_id, ticket_type, description[:1000], "open", business_key, utc_now()))
             conn.commit()

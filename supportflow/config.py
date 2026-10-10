@@ -1,35 +1,33 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
-try:
-    from pydantic_settings import BaseSettings, SettingsConfigDict
-except ImportError:  # pragma: no cover - only used by the dependency-free static smoke environment
-    from pydantic import BaseModel
-
-    class BaseSettings(BaseModel):
-        """Fallback allowing SQLite and workflow tests before optional dependencies are installed."""
-
-    def SettingsConfigDict(**kwargs):
-        return kwargs
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    run_mode: str = "mock"
+    run_mode: Literal["mock", "live"] = "mock"
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
-    llm_input_price_per_1m: float | None = None
-    llm_output_price_per_1m: float | None = None
+    llm_input_price_per_1m: float | None = Field(default=None, ge=0)
+    llm_output_price_per_1m: float | None = Field(default=None, ge=0)
     price_currency: str = "CNY"
     database_path: str = "data/supportflow.db"
     checkpoint_path: str = "data/checkpoints.db"
-    max_model_calls: int = 8
-    max_tool_calls: int = 12
-    task_timeout_seconds: int = 120
-    model_timeout_seconds: int = 30
-    max_model_retries: int = 1
+    max_model_calls: int = Field(default=8, ge=1, le=100)
+    max_tool_calls: int = Field(default=12, ge=1, le=100)
+    task_timeout_seconds: float = Field(default=120, gt=0)
+    model_timeout_seconds: float = Field(default=30, gt=0)
+    max_model_retries: int = Field(default=1, ge=0, le=5)
     policy_version: str = "v1"
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
+    model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore", populate_by_name=True)
+
+    @field_validator("llm_base_url", "llm_api_key", "llm_model", "llm_input_price_per_1m", "llm_output_price_per_1m", mode="before")
+    @classmethod
+    def empty_optional(cls, value):
+        return None if isinstance(value, str) and not value.strip() else value
 
     def ensure_dirs(self) -> None:
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
@@ -37,7 +35,7 @@ class Settings(BaseSettings):
 
     @property
     def live_configured(self) -> bool:
-        return self.run_mode.lower() == "live" and bool(self.llm_api_key and self.llm_model)
+        return bool(self.llm_api_key and self.llm_model)
 
 
 @lru_cache

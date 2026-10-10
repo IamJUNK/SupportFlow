@@ -23,35 +23,70 @@ from supportflow.workflow import WorkflowEngine
 
 def run_scenario(scenario: dict[str, Any], mode: str) -> dict[str, Any]:
     temp_dir = Path(tempfile.mkdtemp(prefix="supportflow-eval-"))
+    engine = None
     try:
         db_path = temp_dir / "scenario.db"
         db = Database(str(db_path))
-        db.seed_demo()
-        settings = Settings(database_path=str(db_path), checkpoint_path=str(temp_dir / "checkpoint.db"), run_mode="mock")
+        clock = "2026-10-10T09:00:00Z"
+        db.seed_demo(clock)
+        initial_orders = {order["order_id"]: db.get_order(order["order_id"]) for order in db.list_orders("demo-customer") + db.list_orders("other-customer")}
+        settings = Settings(_env_file=None, database_path=str(db_path), checkpoint_path=str(temp_dir / "checkpoint.db"), run_mode="mock")
         task, _ = db.create_task("demo-customer", scenario["message"], mode, f"eval-{scenario['id']}")
-        db.update_task(task["task_id"], status="running")
-        engine = WorkflowEngine(db, settings)
+        assert db.claim_next_task() == task["task_id"]
+        engine = WorkflowEngine(db, settings, clock=clock)
         engine.process(task["task_id"])
         current = db.get_task(task["task_id"])
+        for supplement in scenario.get("supplements", []):
+            if current["status"] != "awaiting_input":
+                break
+            db.submit_event(task["task_id"], "supplement", supplement)
+            assert db.claim_next_task() == task["task_id"]
+            engine.process(task["task_id"])
+            current = db.get_task(task["task_id"])
         if current["status"] == "awaiting_confirmation" and scenario.get("auto_confirm", False):
             action = db.get_pending_action(task["task_id"])
             if action:
-                db.append_event(task["task_id"], "confirmation", json.dumps({"action_id": action["action_id"], "decision": "approve"}))
-                db.update_task(task["task_id"], status="running")
+                db.confirm_action(task["task_id"], action["action_id"], scenario.get("decision", "approve"))
+                assert db.claim_next_task() == task["task_id"]
                 engine.process(task["task_id"])
                 current = db.get_task(task["task_id"])
         result = json.loads(current["result_json"]) if current.get("result_json") else {}
-        passed = current["status"] == scenario.get("expected_status")
+        checks = {"status": current["status"] == scenario["expected_status"], "technical_error": current.get("error") is None}
+        if scenario.get("expected_business_status"):
+            checks["business_status"] = result.get("business_status") == scenario["expected_business_status"]
         if scenario.get("expected_order"):
-            passed = passed and scenario["expected_order"] in json.dumps(result)
+            checks["order"] = result.get("order", {}).get("order_id") == scenario["expected_order"]
         if scenario.get("expected_code"):
-            passed = passed and scenario["expected_code"] in json.dumps(result)
-        if scenario.get("expected_ticket"):
-            passed = passed and db.count_tickets("O-1001", "expedite") == 1
+            codes = [result.get("error_code"), result.get("ticket", {}).get("error_code"), result.get("cancel", {}).get("error_code")]
+            checks["error_code"] = scenario["expected_code"] in codes
+        changed_order = scenario.get("cancelled_order")
+        for order_id, before in initial_orders.items():
+            after = db.get_order(order_id)
+            expected = {**before, "status": "cancelled", "version": before["version"] + 1, "refund_required": int(bool(before["paid"]))} if order_id == changed_order else before
+            checks[f"order_state:{order_id}"] = after == expected
+        with db.connection() as conn:
+            journals = [dict(row) for row in conn.execute("SELECT * FROM operation_journal")]
+            tickets = [dict(row) for row in conn.execute("SELECT * FROM tickets")]
+        checks["journal_count"] = len(journals) == (1 if changed_order else 0)
+        if changed_order:
+            checks["cancel_success"] = result.get("cancel", {}).get("ok") is True
+            checks["journal_result"] = len(journals) == 1 and json.loads(journals[0]["result_json"]).get("ok") is True
+        expected_ticket = scenario.get("ticket_order", "O-1001" if scenario.get("expected_ticket") else None)
+        checks["ticket_count"] = len(tickets) == (1 if expected_ticket else 0)
+        if expected_ticket:
+            checks["ticket_binding"] = len(tickets) == 1 and (tickets[0]["order_id"], tickets[0]["customer_id"], tickets[0]["type"]) == (expected_ticket, "demo-customer", "expedite")
+        action = db.get_pending_action(task["task_id"])
+        if scenario["expected_status"] == "awaiting_confirmation":
+            checks["pending_action"] = bool(action and action["status"] == "pending" and action["order_id"] == scenario.get("action_order", "O-1001"))
+        elif not scenario.get("auto_confirm"):
+            checks["no_cancel_proposal"] = action is None
+        passed = all(checks.values())
         trace = db.get_trace(task["task_id"])
-        return {"id": scenario["id"], "mode": mode, "passed": passed, "status": current["status"], "result": result, "trace_events": len(trace), "tool_calls": sum(1 for item in trace if item["call_type"] == "tool"), "model_calls": sum(1 for item in trace if item["call_type"] == "model"), "error": current.get("error")}
+        return {"id": scenario["id"], "mode": mode, "passed": passed, "checks": checks, "status": current["status"], "result": result, "trace_events": len(trace), "tool_calls": sum(1 for item in trace if item["call_type"] == "tool"), "model_calls": sum(1 for item in trace if item["call_type"] == "model"), "error": current.get("error")}
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if engine is not None:
+            engine.close()
+        shutil.rmtree(temp_dir)
 
 
 def load_scenarios(path: Path) -> list[dict[str, Any]]:
@@ -74,16 +109,20 @@ def write_reports(results: list[dict[str, Any]], output_dir: Path, mode: str) ->
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["multi_agent", "single_agent", "both"], default="both")
+    parser.add_argument("--mode", choices=["multi_agent", "single_agent", "both"], default="single_agent", help="multi_agent/both 仅验证旧参数兼容，不代表多 Agent 对比")
     parser.add_argument("--dataset", default=str(ROOT / "evals" / "scenarios.json"))
     parser.add_argument("--output", default=str(ROOT / "reports"))
     args = parser.parse_args()
     scenarios = load_scenarios(Path(args.dataset))
     modes = ["multi_agent", "single_agent"] if args.mode == "both" else [args.mode]
+    all_passed = True
     for mode in modes:
         results = [run_scenario(scenario, mode) for scenario in scenarios]
         write_reports(results, Path(args.output), mode)
         print(f"{mode}: {sum(item['passed'] for item in results)}/{len(results)}")
+        all_passed = all_passed and all(item["passed"] for item in results)
+    if not all_passed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

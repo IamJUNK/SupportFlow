@@ -1,3 +1,3 @@
-"""SupportFlow order after-sales multi-agent MVP."""
+"""SupportFlow order after-sales workflow MVP."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

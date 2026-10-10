@@ -1,6 +1,6 @@
 # SupportFlow
 
-SupportFlow 是一个订单售后后端 MVP：FastAPI 接收任务，SQLite 保存业务状态与轨迹，业务工具执行订单查询、政策检索、取消提案和催发货工单。演示客户固定为 `demo-customer`，所有订单数据均为本地模拟。
+SupportFlow 是一个订单售后后端 MVP。FastAPI 接收任务，SQLite 保存业务状态、确认方案与执行日志；业务层支持订单查询、政策检索、取消提案和催发货工单。演示客户固定为 `demo-customer`，订单和物流数据均为本地模拟。
 
 ## 本地运行
 
@@ -14,40 +14,50 @@ Copy-Item .env.example .env
 python -m supportflow
 ```
 
-浏览 `http://127.0.0.1:8000/docs`。数据文件写入 `data/`，默认 mock 模式无需 API Key。另一个终端可运行 `python scripts/demo.py` 演示查物流和确认取消。
-
-创建任务：
+浏览 `http://127.0.0.1:8000/docs`。默认 `RUN_MODE=mock`，不需要 API Key。
 
 ```powershell
 Invoke-RestMethod -Method Post http://127.0.0.1:8000/tasks `
   -Headers @{"Idempotency-Key"="demo-cancel-1"} `
   -ContentType "application/json" `
-  -Body '{"message":"请取消订单 O-1001","mode":"multi_agent"}'
+  -Body '{"message":"请取消订单 O-1001","execution_mode":"mock","agent_mode":"single_agent"}'
 ```
 
-任务进入 `awaiting_confirmation` 后，将返回的 `pending_action.action_id` 与 `decision=approve` 或 `reject` 发送到 `/tasks/{task_id}/confirmations`。支持的接口包括 `/health`、`/tasks`、`/tasks/{task_id}`、`/events`、`/confirmations` 和 `/trace`。
+任务进入 `awaiting_confirmation` 后，将 `pending_action.action_id` 与 `decision=approve` 或 `reject` 发送到 `/tasks/{task_id}/confirmations`。缺少订单或意图时，任务进入 `awaiting_input`，可通过 `/tasks/{task_id}/events` 补充信息。`completed` 是终态，后续业务请求应创建新任务；技术失败任务可调用 `/tasks/{task_id}/retry` 重试。
 
-## 当前行为
+首次创建数据库时，演示订单时间以当前 UTC 时间为基准；已有订单不会重新计时。旧数据库中超过 24 小时的订单现在会正确拒绝取消。如需重新演示，设置新的 `DATABASE_PATH` 和 `CHECKPOINT_PATH` 后启动，保留原数据库即可。
 
-- `list_my_orders`、`get_order`、`get_tracking`、`search_policy`、`propose_cancel`、`cancel_order` 和 `create_ticket` 都由本地业务服务执行。订单归属从服务端演示上下文注入，模型与用户内容均不能切换客户。
-- 取消方案在批准前不能执行。批准时服务会重新检查客户归属、订单状态和版本；取消更新与 operation journal 位于同一个 SQLite `BEGIN IMMEDIATE` 事务中。相同 `action_id` 重放不会重复生效。
-- 工单业务键由订单号与工单类型确定，重复催发货只创建一张工单。已发货订单会拒绝取消或催发货工单。已付款订单取消会返回 `refund_required=true`；退款没有实现。
-- FastAPI lifespan 启动单进程数据库队列执行器。进程启动时会将遗留的 `running` 任务重新排队；已批准但尚未取消的操作可在恢复时继续。确认与补充等待期间不占执行槽。
-- `RUN_MODE=mock` 不调用模型，仍运行真实的 API、数据库、业务工具、确认和幂等代码。当前 mock 的路由是可重复的规则响应，用来验证工程链路，不代表语言模型 Agent 能力。
-- `RUN_MODE=live` 需要 `LLM_API_KEY`、`LLM_MODEL`，可选 `LLM_BASE_URL`。live 已实现 OpenAI-compatible 原生 tool-calling 循环：模型只能看到查询、政策、取消提案和催发货工具，后端仍负责客户归属、版本复核和确认后的写操作。没有 API Key 时不会伪造业务成功；模型失败会将任务标为技术失败。当前环境没有 API Key，因此 live 真实云模型行为尚未验证。
-- LangGraph 与 SQLite checkpoint 已接入 `WorkflowEngine`，每次流程开始和结束保存任务状态，`CheckpointManager.save/load` 已通过本地 smoke 测试。HTTP 执行器的业务恢复仍依靠业务 SQLite 表和事件重放，checkpoint 用于保存 LangGraph 状态快照，不替代业务事务。
-- `single_agent` 和 `multi_agent` 接受相同业务安全边界；目前两者仍使用本地规则 mock 路径，只有轨迹标签不同，不能据此比较真实模型效果或成本。
+## 执行模型
+
+- `execution_mode` 决定如何识别意图：`mock` 使用确定性规则，`live` 使用 OpenAI-compatible tool calling。省略时继承服务端 `RUN_MODE`。
+- `agent_mode` 当前只支持 `single_agent`。旧参数 `mode=multi_agent` 仍可用于兼容已有客户端，但会按单 Agent 执行，不能用于多 Agent 效果或成本对比。
+- live 模型只提交结构化的意图和订单号。订单归属、政策、查询、确认与所有写操作由后端执行，模型文本不能决定业务成功。
+- mock 与 live 共用相同业务状态机和工具层。否定、冲突、未知或多个订单号会进入澄清，不会默认生成取消方案。
+
+## 一致性与恢复
+
+- 取消必须先生成具体方案并取得确认。确认决定与任务重新入队位于同一 SQLite 事务中，相反决定返回冲突。
+- 取消执行会在事务内重新检查客户、订单状态、版本、24 小时时限和政策版本；订单更新与 operation journal 原子提交，相同 `action_id` 重放不会重复生效。
+- 催发货类型由后端固定为 `expedite`。订单状态检查、唯一业务键和工单写入位于同一事务中。
+- 补充事件和入队原子提交；每次执行只确认实际读取的事件。多轮上下文从完整事件历史重建，最新明确修正优先。
+- 进程启动时恢复遗留 `running` 任务，也兼容升级前已经写入但未入队的确认事件。LangGraph checkpoint 仅用于诊断快照，业务恢复以业务 SQLite 表和幂等日志为准。
+- `/health` 检查数据库和 worker 存活；后台循环异常会记录并退避，不会让执行器静默退出。
 
 ## 测试与评测
 
 ```powershell
 python -m pytest
+python evals/runner.py --mode single_agent
 ```
 
-`tests/` 覆盖订单归属、取消确认、版本复核、取消 journal 幂等、工单唯一性、API 请求幂等、批准后中断恢复、checkpoint 读写和模型工具权限校验。`evals/scenarios.json` 固定了 12 个开发场景与 8 个留出场景；`python evals/runner.py --mode both` 已在本地无模型环境生成 `reports/`，当前 mock 结果为 multi-agent `20/20`、single-agent `20/20`。两种模式共用确定性业务路径，只有轨迹标签不同，因此这组结果只能证明工程保护和评测 harness，不能作为真实 Agent 能力或成本结论。Mock 测试不能作为简历中的真实 Agent 能力指标。
+测试覆盖归属隔离、误取消防护、多轮补充、订单更正、冲突确认、事务回滚、中断恢复、时限与政策复核、工单幂等、模型预算、API 健康检查、旧数据库升级和 checkpoint。
 
-## 技术边界与 Roadmap
+2026-10-10 本地验证：Python 3.12.2，48 项 pytest 测试通过；29 个 mock 场景通过，旧模式参数兼容组同样为 29/29。真实 OpenAI SDK 使用内存 HTTP 替身验证请求、参数和响应解析，没有发送云模型请求。当前依赖会产生一条 LangChain 的未来默认值弃用警告，不影响测试结果。
 
-当前服务按单进程、单任务串行执行设计，不支持多 worker 协调。SQLite 使用 WAL、busy timeout、短连接；不依赖 Docker、向量数据库或本地推理。已在 Python 3.12.14 运行时安装并验证：FastAPI 0.142.4、Uvicorn 0.54.0、LangGraph 0.6.11、langgraph-checkpoint-sqlite 2.0.11、pytest 9.1.1、OpenAI 1.109.1。原有 pytest 8 项测试通过；本轮新增测试场景已通过逐项 smoke，FastAPI TestClient 已验证 `/health`、查询任务后台完成、取消确认、Idempotency-Key 重放和 live 缺少密钥失败；LangGraph 图构建和 SQLite checkpoint 读写均已验证。当前环境没有 API Key，尚未进行真实云模型 live smoke、真实 usage/cost 记录和内存峰值测量。
+评测场景会核对 SQLite 最终订单、版本、退款标记、工单和 operation journal，不能仅靠 `completed` 或文本命中判定通过。`--mode both` 只用于验证旧 `multi_agent` 参数兼容；两组结果来自同一单 Agent 路径。
 
-Roadmap：使用真实云模型完成小规模 live smoke，核对不同模型的 tool-call 参数格式、延迟和 usage/cost 记录；再扩展同数据集的真实 single-agent 对比。生产认证、退款、真实电商/物流、向量检索和分布式队列不在本 MVP 范围内。
+## 当前边界
+
+服务按单进程、单任务串行执行设计，不支持多 worker 协调。退款只记录 `refund_required=true`，没有真实退款流程；认证、真实电商/物流集成、分布式队列和多 Agent 编排不在当前范围内。
+
+`RUN_MODE=live` 需要配置 `LLM_API_KEY` 和 `LLM_MODEL`，可选 `LLM_BASE_URL`。模型端点必须支持 Chat Completions 函数调用以及指定 `tool_choice`。模型调用使用显式截止时间和项目级重试预算。预算按每次后台执行计算，等待用户期间不计时；它不是可强制终止底层同步 I/O 的硬实时保证。返回后和写操作前会再次检查，已经提交的操作通过幂等记录恢复。当前未调用真实云模型，端点兼容性、延迟和费用尚未实测。

@@ -17,9 +17,9 @@ def wait_for(task_id: str) -> dict:
 
 
 def main() -> None:
-    first = httpx.post(f"{BASE}/tasks", json={"message": "请查询订单 O-1002 的物流", "mode": "multi_agent"}, timeout=10).json()
+    first = httpx.post(f"{BASE}/tasks", json={"message": "请查询订单 O-1002 的物流", "execution_mode": "mock", "agent_mode": "single_agent"}, timeout=10).json()
     print("物流查询:", json.dumps(wait_for(first["task_id"]), ensure_ascii=False, indent=2))
-    second = httpx.post(f"{BASE}/tasks", json={"message": "请取消订单 O-1001", "mode": "multi_agent"}, timeout=10).json()
+    second = httpx.post(f"{BASE}/tasks", json={"message": "请取消订单 O-1001", "execution_mode": "mock", "agent_mode": "single_agent"}, timeout=10).json()
     pending = wait_for(second["task_id"])
     print("等待确认:", json.dumps(pending, ensure_ascii=False, indent=2))
     if pending.get("pending_action"):

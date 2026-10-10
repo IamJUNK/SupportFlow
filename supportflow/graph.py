@@ -1,4 +1,4 @@
-"""LangGraph state envelope and SQLite checkpoint integration."""
+"""Diagnostic state snapshots. Business recovery is owned by the business database."""
 
 import sqlite3
 from pathlib import Path
@@ -15,6 +15,7 @@ class WorkflowState(TypedDict, total=False):
     result: dict[str, Any] | None
     error: str | None
     updated_at: str | None
+    context: dict[str, Any]
 
 
 class CheckpointManager:
@@ -26,6 +27,7 @@ class CheckpointManager:
         self.path = str(Path(path))
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
+        # Keep the constructor compatible with langgraph-checkpoint-sqlite 2.x.
         self.saver = SqliteSaver(self.connection)
         self.saver.setup()
         self.graph = self._build_checkpoint_graph()
@@ -48,24 +50,3 @@ class CheckpointManager:
 
     def close(self) -> None:
         self.connection.close()
-
-
-def build_graph(checkpoint_path: str | None = None):
-    if checkpoint_path:
-        return CheckpointManager(checkpoint_path).graph
-    try:
-        from langgraph.graph import END, START, StateGraph
-    except ImportError:
-        return None
-
-    graph = StateGraph(WorkflowState)
-    graph.add_node("supervisor", lambda state: state)
-    graph.add_node("order_agent", lambda state: state)
-    graph.add_node("after_sales_agent", lambda state: state)
-    graph.add_node("finish", lambda state: state)
-    graph.add_edge(START, "supervisor")
-    graph.add_conditional_edges("supervisor", lambda state: state.get("intent", "unknown"), {"query_order": "order_agent", "cancel_order": "order_agent", "create_ticket": "order_agent", "unknown": "finish"})
-    graph.add_edge("order_agent", "after_sales_agent")
-    graph.add_edge("after_sales_agent", "finish")
-    graph.add_edge("finish", END)
-    return graph.compile()
